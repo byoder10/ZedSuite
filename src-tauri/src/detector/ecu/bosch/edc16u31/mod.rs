@@ -803,7 +803,7 @@ impl EDC16U31Detector {
         // sélecteurs ne doit pas les recevoir deux fois.
         {
             let mut seen: HashSet<u32> = all_maps.iter().map(|m| m.address).collect();
-            super::map_maf_switch::detect_smoke_switches(data, &mut all_maps, &mut seen);
+            super::map_maf_switch::detect_smoke_switches(data, &mut all_maps, &mut seen, false);
         }
 
         Self::normalize_boost_names(&mut all_maps);

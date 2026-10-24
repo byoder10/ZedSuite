@@ -225,7 +225,23 @@ pub fn import_map_definitions(
 ///       que l'axe de régime a été réécrit) ; EDC16U34 : un SVRL sous
 ///       3000 tr/min n'est plus retenu (issue #50) ; MAP linearisation à
 ///       l'axe brut, comme EDCSuite (913 et 44 sur un capteur 4 bars).
-pub const DETECTOR_VERSION: u32 = 50;
+///   51 — EDC16U34 : corrections d'avance (démarrage, température d'air,
+///       altitude) avec leurs sélecteurs, sélecteur des driver wish, driver
+///       wish inverse, MAF linearisation et pause minimale après la
+///       principale affichées (cette dernière en µs, axe en °V) — réf. XDF
+///       complète 03G906016AB 376708.
+///   52 — EDC16U34 : bornes N75 max/min, masse d'air de substitution,
+///       facteurs d'échelle de la pression de suralimentation, switchs de
+///       sonde lambda (LSU, adaptation) et switch d'espace de fumée ;
+///       limitations lambda mises à zéro et switchs de fumée retrouvés sur
+///       un fichier préparé ; plus de « EGR hysteresis » dans le code des
+///       2 Mo — réf. 03G906016AB d'origine / immo-ON-BAK.
+///   53 — EDC16U34 : consignes de ralenti moteur chaud et au démarrage
+///       (courbes 1x4 sur la pression atmo), axes de la carte de ralenti
+///       3x4 remis dans l'ordre (X = pression, Y = température d'eau),
+///       coupure de démarreur nommée comme telle, et plus de « Single value
+///       idle speed » quand les courbes de consigne existent.
+pub const DETECTOR_VERSION: u32 = 53;
 
 /// Version du moteur de détection, pour comparaison avec celle enregistrée
 /// dans un projet.
@@ -411,6 +427,13 @@ fn build_expected_report(
                         _ => false,
                     })
                     .count()
+            } else if label == "Single value idle speed" {
+                // EDC16U34 : consigne de ralenti en courbe (warm engine), pas
+                // en scalaire
+                count_starts(prefix) + count_starts("Idle speed setpoint warm engine")
+            } else if label == "Driver Wish (groupe)" {
+                // Le sélecteur porte le préfixe sans être une driver wish
+                count_starts(prefix) - count_starts("Driver Wish Selector")
             } else {
                 count_starts(prefix)
             },

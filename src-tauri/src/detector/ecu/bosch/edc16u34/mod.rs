@@ -785,6 +785,73 @@ impl EDC16U34Detector {
         log::debug!("🔧 [EDC16] After SOI validation: {} total maps ({} valid SOI blocks)",
                   all_maps.len(), valid_block_starts.len());
 
+        // ========== PHASE 2.5: corrections d'avance, sélecteur DW, DW inverse ==========
+        // Après la validation SOI : les blocs principal et dynamique ont déjà
+        // réservé leurs octets. Réservations reprises des seules maps
+        // retenues : un faux bloc SOI écarté par la validation (0x1D7BAC sur
+        // 03G906016AB, à cheval sur les corrections) garde sinon les siennes.
+        let mut kept_ranges: HashSet<(u32, u32)> = all_maps
+            .iter()
+            .map(|m| (m.address, m.address + m.size as u32))
+            .collect();
+        let mut late_maps =
+            self.detect_soi_correction_blocks(data, scan_start, scan_end, &kept_ranges);
+        late_maps.extend(self.detect_inverse_driver_wish(data, scan_start, scan_end, &kept_ranges));
+        late_maps.extend(self.detect_n75_duty_limits(data, scan_start, scan_end, &kept_ranges));
+        late_maps.extend(self.detect_substitute_air_mass(data, scan_start, scan_end, &kept_ranges));
+        late_maps.extend(self.detect_pressure_scale_factors(data, scan_start, scan_end));
+        late_maps.extend(self.detect_lambda_sensor_switches(data, scan_start, scan_end));
+        let (idle_curves, cold_idle) = self.detect_idle_setpoint_curves(data, scan_start, scan_end);
+        late_maps.extend(idle_curves);
+        if let Some(cold_idle) = cold_idle {
+            // Avec les courbes de consigne, le ralenti n'est pas un scalaire :
+            // les « Single value idle speed » trouvés par motif de valeurs
+            // sont d'autres paramètres (0x1E6714 temporisation d'erreur,
+            // 0x1E7B40 régime max de compensation au démarrage, XDF
+            // 03G906016AB). Et la carte 3x4 qui ne suit pas la consigne
+            // chaude est la coupure de démarreur (0x1E7B06).
+            all_maps.retain(|m| {
+                !m.name.as_deref().map_or(false, |n| n.starts_with("Single value idle speed"))
+            });
+            let mut idle_index = 0;
+            for m in all_maps.iter_mut() {
+                let is_idle_map = m.name.as_deref().map_or(false, |n| {
+                    n.starts_with("Idle speed correction by engine temp")
+                });
+                if !is_idle_map {
+                    continue;
+                }
+                if m.address == cold_idle {
+                    idle_index += 1;
+                    m.name = Some(format!("Idle speed correction by engine temp {}", idle_index));
+                } else {
+                    m.name = Some("Starting cut-out speed".to_string());
+                    m.category = Some("Other".to_string());
+                    m.description = Some(
+                        "Engine speed at which the starter is cut out (rpm) | X: Atm pressure (mbar) | Y: Coolant temp (°C)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        {
+            let driver_wish: Vec<&DetectedMap> = all_maps
+                .iter()
+                .filter(|m| m.name.as_deref() == Some("Driver Wish"))
+                .collect();
+            if let Some(first) = driver_wish.iter().min_by_key(|m| m.address) {
+                late_maps.extend(self.detect_driver_wish_selector(data, first, driver_wish.len()));
+            }
+        }
+        for map in late_maps {
+            let range = (map.address, map.address + map.size as u32);
+            if !self.overlaps(&kept_ranges, range) {
+                kept_ranges.insert(range);
+                detected_ranges.insert(range);
+                all_maps.push(map);
+            }
+        }
+
         // Rename SOI Dynamic maps to "Start of injection (Dynamic)" for display
         // These maps are now included in the output for users to modify
         let mut dynamic_count = 0;
@@ -815,7 +882,7 @@ impl EDC16U34Detector {
         // sélecteurs ne doit pas les recevoir deux fois.
         {
             let mut seen: HashSet<u32> = all_maps.iter().map(|m| m.address).collect();
-            super::map_maf_switch::detect_smoke_switches(data, &mut all_maps, &mut seen);
+            super::map_maf_switch::detect_smoke_switches(data, &mut all_maps, &mut seen, true);
         }
 
         Self::normalize_boost_names(&mut all_maps);
@@ -5178,21 +5245,771 @@ impl EDC16U34Detector {
                 MapDimensions::TwoDimensional { rows: 6, cols: 4 },
                 DataType::Int16,
             );
+            // Pause en µs (bruts 1100..1250), axe X = durée de la principale
+            // en degrés vilebrequin (bruts 85..341 ×3/128) — réf. XDF
+            // 03G906016AB 376708.
             map.name = Some("Duration min. injection break after main injection".to_string());
             map.category = Some(MapCategory::InjectionSystem.display_name().to_string());
-            map.unit = Some("deg CrS".to_string());
-            map.correction_factor = Some(0.023427);
+            map.unit = Some("µs".to_string());
+            map.correction_factor = Some(1.0);
             map.y_axis_address = Some(y0 as u32);
-            map.y_label = Some("rpm".to_string());
+            map.y_label = Some("Engine speed (rpm)".to_string());
             map.y_axis_correction = Some(1.0);
             map.x_axis_address = Some(x0 as u32);
-            map.x_label = Some("mg/stroke".to_string());
-            map.x_axis_correction = Some(0.01);
+            map.x_label = Some("Main injection duration (deg CrS)".to_string());
+            map.x_axis_correction = Some(0.0234375);
+            map.description = Some(
+                "Minimum break after the main injection (µs) | X: Main injection duration (deg CrS) | Y: Engine speed (rpm)"
+                    .to_string(),
+            );
             map.confidence = 0.9;
             log::debug!("✅ [EDC16U34] Found Duration min. injection break (6x4) at 0x{:X}", d0);
             return Some(map);
         }
         None
+    }
+
+    /// Blocs de corrections d'avance rangés comme le bloc SOI principal :
+    /// N maps contiguës, puis leurs axes partagés et le sélecteur qui choisit
+    /// la map selon une troisième grandeur :
+    ///   [N maps R×C][R][axe régime R][C][axe X C][N][axe sélecteur N][sélecteur N]
+    /// Le sélecteur vaut 0, 0x100, 0x200… (index de map ×256), toujours < N.
+    /// Trois blocs relevés derrière le bloc principal (03G906016AB 376708,
+    /// réf. XDF Ecusuite) :
+    ///  - start correction : 4 maps 6x10 régime de démarrage × température
+    ///    d'eau, sélecteur sur la pression atmosphérique (0x1D8082) ;
+    ///  - air temperature correction : 6 maps 16x14 régime × IQ, sélecteur
+    ///    sur la température d'air (0x1D82AC) ;
+    ///  - altitude correction : 6 maps 16x14 régime × IQ, sélecteur sur la
+    ///    pression atmosphérique (0x1D920E).
+    /// Le bloc principal (N = 10) et le bloc dynamique (qui commence juste
+    /// après le sélecteur principal) gardent leurs propres règles : ils sont
+    /// écartés ici, comme tout bloc qui recouvre une map déjà retenue.
+    fn detect_soi_correction_blocks(
+        &self,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        detected_ranges: &HashSet<(u32, u32)>,
+    ) -> Vec<DetectedMap> {
+        let mut maps = Vec::new();
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let increasing = |v: &[u16]| v.windows(2).all(|w| w[0] < w[1]);
+        // Dixièmes de kelvin (-73..+177 °C) / hPa
+        let is_temp = |v: &[u16]| v.iter().all(|&t| (2000..=4500).contains(&t));
+        let is_pressure = |v: &[u16]| v.iter().all(|&p| (400..=1200).contains(&p));
+        let end = end.min(data.len());
+        let mut main_selector_end: Option<usize> = None;
+
+        let mut p = start;
+        while p + 4 < end {
+            let rows = rd(p) as usize;
+            if !(4..=16).contains(&rows) || p + 2 + rows * 2 + 2 > end {
+                p += 2;
+                continue;
+            }
+            let y0 = p + 2;
+            let y: Vec<u16> = (0..rows).map(|k| rd(y0 + k * 2)).collect();
+            if !increasing(&y) || !(1000..=6000).contains(&y[rows - 1]) {
+                p += 2;
+                continue;
+            }
+            let q = y0 + rows * 2;
+            let cols = rd(q) as usize;
+            if !(4..=16).contains(&cols) || q + 2 + cols * 2 + 2 > end {
+                p += 2;
+                continue;
+            }
+            let x0 = q + 2;
+            let x: Vec<u16> = (0..cols).map(|k| rd(x0 + k * 2)).collect();
+            if !increasing(&x) {
+                p += 2;
+                continue;
+            }
+            let r = x0 + cols * 2;
+            let n = rd(r) as usize;
+            if !(2..=12).contains(&n) || r + 2 + n * 4 > end {
+                p += 2;
+                continue;
+            }
+            let a0 = r + 2;
+            let sel_axis: Vec<u16> = (0..n).map(|k| rd(a0 + k * 2)).collect();
+            let s0 = a0 + n * 2;
+            let sel: Vec<u16> = (0..n).map(|k| rd(s0 + k * 2)).collect();
+            if !increasing(&sel_axis)
+                || sel[0] != 0
+                || sel.iter().any(|&v| v % 256 != 0 || (v / 256) as usize >= n)
+            {
+                p += 2;
+                continue;
+            }
+            let sel_end = s0 + n * 2;
+            let map_size = rows * cols * 2;
+            let Some(base) = p.checked_sub(n * map_size) else {
+                p += 2;
+                continue;
+            };
+
+            // Bloc principal, puis bloc dynamique collé à son sélecteur
+            if n == 10 {
+                main_selector_end = Some(sel_end);
+                p = sel_end;
+                continue;
+            }
+            if main_selector_end == Some(base) {
+                p = sel_end;
+                continue;
+            }
+
+            let soi_grid = (12..=16).contains(&rows)
+                && (10..=16).contains(&cols)
+                && y[0] <= 300
+                && y[rows - 1] >= 3000
+                && x[0] <= 700
+                && (2500..=8000).contains(&x[cols - 1]);
+            let start_grid = rows <= 8
+                && (6..=12).contains(&cols)
+                && y[0] <= 300
+                && y[rows - 1] <= 2500
+                && is_temp(&x);
+            let kind = if start_grid && is_pressure(&sel_axis) {
+                "start correction"
+            } else if soi_grid && is_temp(&sel_axis) {
+                "air temperature correction"
+            } else if soi_grid && is_pressure(&sel_axis) {
+                "altitude correction"
+            } else {
+                p += 2;
+                continue;
+            };
+
+            // Avances plausibles (±35 °V) et pas un bloc entièrement vide
+            let block = &data[base..p];
+            let soi_like = block
+                .chunks_exact(2)
+                .all(|c| (-1500..=1500).contains(&i16::from_be_bytes([c[0], c[1]])));
+            if !soi_like || block.iter().all(|&b| b == 0) {
+                p += 2;
+                continue;
+            }
+            if self.overlaps(detected_ranges, (base as u32, sel_end as u32)) {
+                p = sel_end;
+                continue;
+            }
+
+            let (x_label, x_corr, x_off) = if kind == "start correction" {
+                ("Water temp (°C)", 0.1, -273.14)
+            } else {
+                ("IQ (mg/stroke)", 0.01, 0.0)
+            };
+            for i in 0..n {
+                let mut m = DetectedMap::new(
+                    (base + i * map_size) as u32,
+                    map_size,
+                    MapDimensions::TwoDimensional { rows, cols },
+                    DataType::Int16,
+                );
+                m.name = Some(format!("Start of injection {} {:02}", kind, i));
+                m.category = Some(MapCategory::StartOfInjection.display_name().to_string());
+                m.unit = Some("deg CrS".to_string());
+                m.correction_factor = Some(0.0234375);
+                m.y_axis_address = Some(y0 as u32);
+                m.y_label = Some("Engine speed (rpm)".to_string());
+                m.y_axis_correction = Some(1.0);
+                m.x_axis_address = Some(x0 as u32);
+                m.x_label = Some(x_label.to_string());
+                m.x_axis_correction = Some(x_corr);
+                m.x_axis_offset = Some(x_off);
+                m.y_axis_inverted = Some(true);
+                m.description = Some(format!(
+                    "Start of injection {} (deg CrS) | X: {} | Y: Engine speed (rpm)",
+                    kind, x_label
+                ));
+                m.confidence = 0.9;
+                maps.push(m);
+            }
+
+            // Même lecture que le SOI Selector : index ×256 lu en petit-boutiste
+            let (sel_label, sel_corr, sel_off) = if is_temp(&sel_axis) {
+                ("Intake air temp (°C)", 0.1, -273.14)
+            } else {
+                ("Atm pressure (mbar)", 1.0, 0.0)
+            };
+            let mut s = DetectedMap::new(
+                s0 as u32,
+                n * 2,
+                MapDimensions::OneDimensional { length: n },
+                DataType::UInt16,
+            );
+            s.name = Some(format!("SOI {} selector", kind));
+            s.category = Some(MapCategory::StartOfInjection.display_name().to_string());
+            s.unit = Some("[-]".to_string());
+            s.correction_factor = Some(1.0);
+            s.offset = Some(0.0);
+            s.is_little_endian = Some(true);
+            s.x_axis_address = Some(a0 as u32);
+            s.x_label = Some(sel_label.to_string());
+            s.x_axis_correction = Some(sel_corr);
+            s.x_axis_offset = Some(sel_off);
+            s.description = Some(format!(
+                "Index of the start of injection {} map in use | X: {}",
+                kind, sel_label
+            ));
+            s.confidence = 0.9;
+            maps.push(s);
+
+            log::debug!(
+                "✅ [EDC16U34] Found SOI {} block: {} maps {}x{} at 0x{:X}, selector at 0x{:X}",
+                kind, n, rows, cols, base, s0
+            );
+            p = sel_end;
+        }
+        maps
+    }
+
+    /// Sélecteur des driver wish : courbe [N][axe v/n N][sélecteur N] placée
+    /// juste avant l'en-tête de la première driver wish (0x1C2344 sur
+    /// 03G906016AB 376708). L'axe est le rapport vitesse/régime, donc le
+    /// rapport engagé ; le sélecteur vaut l'index de la driver wish ×256,
+    /// comme les sélecteurs SOI et duration.
+    fn detect_driver_wish_selector(
+        &self,
+        data: &[u8],
+        first_dw: &DetectedMap,
+        dw_count: usize,
+    ) -> Option<DetectedMap> {
+        let MapDimensions::TwoDimensional { rows, cols } = first_dw.dimensions else {
+            return None;
+        };
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let header = (first_dw.address as usize).checked_sub(4 + 2 * (rows + cols))?;
+        let (h0, h1) = (rd(header) as usize, rd(header + 2) as usize);
+        if h0 * h1 != rows * cols || h0 + h1 != rows + cols {
+            return None;
+        }
+
+        let lo = header.saturating_sub(0x80);
+        let mut p = header.checked_sub(4)?;
+        while p >= lo {
+            let n = rd(p) as usize;
+            let a0 = p + 2;
+            let s0 = a0 + n * 2;
+            if (3..=10).contains(&n) && s0 + n * 2 <= header {
+                let axis: Vec<u16> = (0..n).map(|k| rd(a0 + k * 2)).collect();
+                let sel: Vec<u16> = (0..n).map(|k| rd(s0 + k * 2)).collect();
+                if axis[0] > 0
+                    && axis[n - 1] <= 30000
+                    && axis.windows(2).all(|w| w[0] < w[1])
+                    && sel[0] == 0
+                    && sel.iter().all(|&v| v % 256 == 0 && ((v / 256) as usize) < dw_count)
+                {
+                    let mut m = DetectedMap::new(
+                        s0 as u32,
+                        n * 2,
+                        MapDimensions::OneDimensional { length: n },
+                        DataType::UInt16,
+                    );
+                    m.name = Some("Driver Wish Selector".to_string());
+                    m.category = Some(MapCategory::EngineTorqueRequest.display_name().to_string());
+                    m.unit = Some("[-]".to_string());
+                    m.correction_factor = Some(1.0);
+                    m.offset = Some(0.0);
+                    m.is_little_endian = Some(true);
+                    m.x_axis_address = Some(a0 as u32);
+                    m.x_label = Some("Speed/rpm ratio ((km/h)/rpm)".to_string());
+                    m.x_axis_correction = Some(0.00001);
+                    m.x_axis_offset = Some(0.0);
+                    m.description = Some(
+                        "Index of the driver wish map in use, by gear (vehicle speed / engine speed) | X: Speed/rpm ratio ((km/h)/rpm)"
+                            .to_string(),
+                    );
+                    m.confidence = 0.9;
+                    log::debug!("✅ [EDC16U34] Found Driver Wish Selector at 0x{:X}", s0);
+                    return Some(m);
+                }
+            }
+            if p < 2 {
+                break;
+            }
+            p -= 2;
+        }
+        None
+    }
+
+    /// Driver wish inverse : 12x16 [000C][0010][régime 12 depuis 0][couple
+    /// 16 depuis 0][pédale %] — pédale virtuelle déduite d'un couple demandé
+    /// (régulateur de vitesse, réduction de couple). Deux maps sur
+    /// 03G906016AB 376708 (0x1E6D24, 0x1E6FD2). La grille 12 lignes écarte
+    /// la map de swirl 16x16, dont l'en-tête a la même forme.
+    fn detect_inverse_driver_wish(
+        &self,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        detected_ranges: &HashSet<(u32, u32)>,
+    ) -> Vec<DetectedMap> {
+        const ROWS: usize = 12;
+        const COLS: usize = 16;
+        const SIZE: usize = ROWS * COLS * 2;
+        let mut maps = Vec::new();
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let end = end.min(data.len());
+        let mut p = start;
+        while p + 4 + 2 * (ROWS + COLS) + SIZE <= end && maps.len() < 2 {
+            if rd(p) as usize != ROWS || rd(p + 2) as usize != COLS {
+                p += 2;
+                continue;
+            }
+            let y0 = p + 4;
+            let x0 = y0 + ROWS * 2;
+            let d0 = x0 + COLS * 2;
+            let y: Vec<u16> = (0..ROWS).map(|k| rd(y0 + k * 2)).collect();
+            let x: Vec<u16> = (0..COLS).map(|k| rd(x0 + k * 2)).collect();
+            if y[0] > 200
+                || !(4000..=6000).contains(&y[ROWS - 1])
+                || y.windows(2).any(|w| w[0] >= w[1])
+                || x[0] != 0
+                || !(1000..=6000).contains(&x[COLS - 1])
+                || x.windows(2).any(|w| w[0] >= w[1])
+            {
+                p += 2;
+                continue;
+            }
+            // Pédale 0..100 %, croissante avec le couple sur la plupart des lignes
+            let vals: Vec<u16> = (0..ROWS * COLS).map(|k| rd(d0 + k * 2)).collect();
+            let monotonic_rows = vals
+                .chunks_exact(COLS)
+                .filter(|r| r.windows(2).all(|w| w[0] <= w[1]))
+                .count();
+            if vals.iter().any(|&v| v > 10000) || monotonic_rows < ROWS / 2 {
+                p += 2;
+                continue;
+            }
+            if self.overlaps(detected_ranges, (d0 as u32, (d0 + SIZE) as u32)) {
+                p = d0 + SIZE;
+                continue;
+            }
+            let mut m = DetectedMap::new(
+                d0 as u32,
+                SIZE,
+                MapDimensions::TwoDimensional { rows: ROWS, cols: COLS },
+                DataType::UInt16,
+            );
+            m.name = Some(format!("Inverse driver wish {:02}", maps.len() + 1));
+            m.category = Some(MapCategory::EngineTorqueRequest.display_name().to_string());
+            m.unit = Some("%".to_string());
+            m.correction_factor = Some(0.01);
+            m.y_axis_address = Some(y0 as u32);
+            m.y_label = Some("Engine speed (rpm)".to_string());
+            m.y_axis_correction = Some(1.0);
+            m.x_axis_address = Some(x0 as u32);
+            m.x_label = Some("Torque (Nm)".to_string());
+            m.x_axis_correction = Some(0.1);
+            m.description = Some(
+                "Pedal position for a requested torque (%) | X: Torque (Nm) | Y: Engine speed (rpm)"
+                    .to_string(),
+            );
+            m.confidence = 0.9;
+            log::debug!("✅ [EDC16U34] Found Inverse driver wish at 0x{:X}", d0);
+            maps.push(m);
+            p = d0 + SIZE;
+        }
+        maps
+    }
+
+    /// Bornes du rapport cyclique N75, rangées à la suite de la courbe de
+    /// linéarisation du rapport cyclique (0x1E5852 sur 03G906016AB 376708) :
+    ///   [N][axe % 0..100 N][linéarisation N]
+    ///   [R][10][régime R][IQ 10][maximum R×10]   (16x10, 0x1E58B4)
+    ///   [R][10][régime R][IQ 10][minimum R×10]   (6x10, 0x1E5A18)
+    /// Une préparation relève le maximum (70 → 95 %) et met le minimum à 0
+    /// (immo-ON-BAK).
+    fn detect_n75_duty_limits(
+        &self,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        detected_ranges: &HashSet<(u32, u32)>,
+    ) -> Vec<DetectedMap> {
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let increasing = |v: &[u16]| v.windows(2).all(|w| w[0] < w[1]);
+        let end = end.min(data.len());
+        // [R][C][régime R][IQ C][R×C cellules ≤ 100 %] → (début des données, R, C, fin)
+        let read_map = |h: usize| -> Option<(usize, usize, usize, usize)> {
+            if h + 4 > end {
+                return None;
+            }
+            let (rows, cols) = (rd(h) as usize, rd(h + 2) as usize);
+            if !(4..=16).contains(&rows) || !(6..=12).contains(&cols) {
+                return None;
+            }
+            let y0 = h + 4;
+            let x0 = y0 + rows * 2;
+            let d0 = x0 + cols * 2;
+            let d1 = d0 + rows * cols * 2;
+            if d1 > end {
+                return None;
+            }
+            let y: Vec<u16> = (0..rows).map(|k| rd(y0 + k * 2)).collect();
+            let x: Vec<u16> = (0..cols).map(|k| rd(x0 + k * 2)).collect();
+            let ok = increasing(&y)
+                && y[0] <= 1000
+                && (3000..=6000).contains(&y[rows - 1])
+                && increasing(&x)
+                && x[0] <= 700
+                && (1500..=8000).contains(&x[cols - 1])
+                && (d0..d1).step_by(2).all(|o| rd(o) <= 10000);
+            ok.then_some((d0, rows, cols, d1))
+        };
+
+        let mut p = start;
+        while p + 4 < end {
+            let n = rd(p) as usize;
+            if !(11..=25).contains(&n) || p + 2 + n * 4 + 4 > end {
+                p += 2;
+                continue;
+            }
+            let a0 = p + 2;
+            let axis: Vec<u16> = (0..n).map(|k| rd(a0 + k * 2)).collect();
+            if axis[0] != 0 || axis[n - 1] != 10000 || !increasing(&axis) {
+                p += 2;
+                continue;
+            }
+            let l0 = a0 + n * 2;
+            let Some(max) = read_map(l0 + n * 2) else {
+                p += 2;
+                continue;
+            };
+            let Some(min) = read_map(max.3) else {
+                p += 2;
+                continue;
+            };
+
+            let mut maps = Vec::new();
+            for ((d0, rows, cols, _), name, what) in [
+                (max, "N75 max allowed duty cycle", "Maximum"),
+                (min, "N75 min allowed duty cycle", "Minimum"),
+            ] {
+                let size = rows * cols * 2;
+                if self.overlaps(detected_ranges, (d0 as u32, (d0 + size) as u32)) {
+                    continue;
+                }
+                let x0 = d0 - cols * 2;
+                let y0 = x0 - rows * 2;
+                let mut m = DetectedMap::new(
+                    d0 as u32,
+                    size,
+                    MapDimensions::TwoDimensional { rows, cols },
+                    DataType::UInt16,
+                );
+                m.name = Some(name.to_string());
+                m.category =
+                    Some(MapCategory::TurboBoostPressureControl.display_name().to_string());
+                m.unit = Some("%".to_string());
+                m.correction_factor = Some(0.01);
+                m.y_axis_address = Some(y0 as u32);
+                m.y_label = Some("Engine speed (rpm)".to_string());
+                m.y_axis_correction = Some(1.0);
+                m.x_axis_address = Some(x0 as u32);
+                m.x_label = Some("IQ (mg/stroke)".to_string());
+                m.x_axis_correction = Some(0.01);
+                m.description = Some(format!(
+                    "{} N75 duty cycle allowed (%) | X: IQ (mg/stroke) | Y: Engine speed (rpm)",
+                    what
+                ));
+                m.confidence = 0.9;
+                log::debug!("✅ [EDC16U34] Found {} ({}x{}) at 0x{:X}", name, rows, cols, d0);
+                maps.push(m);
+            }
+            return maps;
+        }
+        Vec::new()
+    }
+
+    /// Masse d'air de substitution quand le débitmètre est en défaut :
+    /// 8x8 [0008][0008][régime depuis 0][pression atmo → suralimentation]
+    /// [masse d'air mg ×0.1] (0x1C3A60 sur 03G906016AB 376708 : 550 mg
+    /// d'origine, 1250 mg sur la préparation immo-ON-BAK). La map de
+    /// limitation du gouverneur lambda a le même en-tête mais un axe X qui
+    /// part de 1000 et des cellules en %.
+    fn detect_substitute_air_mass(
+        &self,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        detected_ranges: &HashSet<(u32, u32)>,
+    ) -> Option<DetectedMap> {
+        const N: usize = 8;
+        const SIZE: usize = N * N * 2;
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let end = end.min(data.len());
+        let mut p = start;
+        while p + 4 + 4 * N + SIZE <= end {
+            if rd(p) as usize != N || rd(p + 2) as usize != N {
+                p += 2;
+                continue;
+            }
+            let y0 = p + 4;
+            let x0 = y0 + N * 2;
+            let d0 = x0 + N * 2;
+            let y: Vec<u16> = (0..N).map(|k| rd(y0 + k * 2)).collect();
+            let x: Vec<u16> = (0..N).map(|k| rd(x0 + k * 2)).collect();
+            let ok = y[0] == 0
+                && (3000..=5000).contains(&y[N - 1])
+                && y.windows(2).all(|w| w[0] < w[1])
+                && (600..=900).contains(&x[0])
+                && (2000..=3500).contains(&x[N - 1])
+                && x.windows(2).all(|w| w[0] < w[1])
+                && (d0..d0 + SIZE).step_by(2).all(|o| (1000..=20000).contains(&rd(o)));
+            if !ok || self.overlaps(detected_ranges, (d0 as u32, (d0 + SIZE) as u32)) {
+                p += 2;
+                continue;
+            }
+            let mut m = DetectedMap::new(
+                d0 as u32,
+                SIZE,
+                MapDimensions::TwoDimensional { rows: N, cols: N },
+                DataType::UInt16,
+            );
+            m.name = Some("Substitute air mass on MAF error".to_string());
+            m.category = Some(MapCategory::AirControl.display_name().to_string());
+            m.unit = Some("mg/stroke".to_string());
+            m.correction_factor = Some(0.1);
+            m.y_axis_address = Some(y0 as u32);
+            m.y_label = Some("Engine speed (rpm)".to_string());
+            m.y_axis_correction = Some(1.0);
+            m.x_axis_address = Some(x0 as u32);
+            m.x_label = Some("Boost pressure (mbar)".to_string());
+            m.x_axis_correction = Some(1.0);
+            m.description = Some(
+                "Air mass used when the MAF sensor is faulty (mg/stroke) | X: Boost pressure (mbar) | Y: Engine speed (rpm)"
+                    .to_string(),
+            );
+            m.confidence = 0.9;
+            log::debug!("✅ [EDC16U34] Found Substitute air mass on MAF error at 0x{:X}", d0);
+            return Some(m);
+        }
+        None
+    }
+
+    /// Facteurs d'échelle de la pression de suralimentation vers le
+    /// diagnostic (DSM et interface diagnostic, ×0.0001). Une préparation
+    /// avec capteur MAP plus gros les réécrit avec la MAP linearisation
+    /// (0.098 → 0.0857 sur immo-ON-BAK). Table des conversions [offset]
+    /// [échelle] DSM/CAN/diag ; repère : l'échelle diag de la pression FAP
+    /// [0080][0F52], puis un triplet neutre [0000 2710]×3, puis le triplet
+    /// pression [0000][S][0000][2710][0000][S] (0x1C1280 sur 03G906016AB).
+    fn detect_pressure_scale_factors(&self, data: &[u8], start: usize, end: usize) -> Vec<DetectedMap> {
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let end = end.min(data.len());
+        let neutral = |o: usize| (0..3).all(|k| rd(o + k * 4) == 0 && rd(o + k * 4 + 2) == 10000);
+        let mut p = start;
+        while p + 4 + 12 + 12 <= end {
+            if rd(p) != 0x0080 || rd(p + 2) != 0x0F52 || !neutral(p + 4) {
+                p += 2;
+                continue;
+            }
+            let t = p + 16;
+            let (dsm, dia) = (rd(t + 2), rd(t + 10));
+            if rd(t) != 0
+                || rd(t + 4) != 0
+                || rd(t + 6) != 10000
+                || rd(t + 8) != 0
+                || !(100..=10000).contains(&dsm)
+                || !(100..=10000).contains(&dia)
+            {
+                p += 2;
+                continue;
+            }
+            let mut maps = Vec::new();
+            for (at, name) in [
+                (t + 2, "Boost pressure scale factor (DSM)"),
+                (t + 10, "Boost pressure scale factor (diagnostic)"),
+            ] {
+                let mut m = DetectedMap::new(
+                    at as u32,
+                    2,
+                    MapDimensions::TwoDimensional { rows: 1, cols: 1 },
+                    DataType::UInt16,
+                );
+                m.name = Some(name.to_string());
+                m.category = Some("MAP Sensor".to_string());
+                m.unit = Some("-".to_string());
+                m.correction_factor = Some(0.0001);
+                m.offset = Some(0.0);
+                m.description = Some(
+                    "Scale of the boost pressure sent to diagnostics; change it with the MAP linearisation"
+                        .to_string(),
+                );
+                m.confidence = 0.9;
+                maps.push(m);
+            }
+            log::debug!("✅ [EDC16U34] Found boost pressure scale factors at 0x{:X}", t + 2);
+            return maps;
+        }
+        Vec::new()
+    }
+
+    /// Switchs de la sonde lambda large bande (switchs logiciels Bosch :
+    /// [valeur 0|1][type 02]) :
+    ///  - activation LSU : suivi de la tension batterie minimale puis de la
+    ///    courbe lambda réciproque [000B][courant de pompe signé croissant 11]
+    ///    [11 valeurs décroissantes] (0x1E23F0 sur 03G906016AB 376708) ;
+    ///  - adaptation : premier [0|1][02][température d'air 0..100 °C] dans
+    ///    les 0x600 octets suivants (0x1E251A).
+    /// Une préparation sonde coupée met les deux à 0 (immo-ON-BAK).
+    fn detect_lambda_sensor_switches(&self, data: &[u8], start: usize, end: usize) -> Vec<DetectedMap> {
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let rds = |o: usize| rd(o) as i16;
+        let end = end.min(data.len());
+        let switch = |at: usize, name: &str, description: &str| {
+            let mut m = DetectedMap::new(
+                at as u32,
+                1,
+                MapDimensions::TwoDimensional { rows: 1, cols: 1 },
+                DataType::UInt8,
+            );
+            m.name = Some(name.to_string());
+            m.category = Some("Lambda sensor".to_string());
+            m.unit = Some("-".to_string());
+            m.correction_factor = Some(1.0);
+            m.offset = Some(0.0);
+            m.description = Some(description.to_string());
+            m.confidence = 0.9;
+            m
+        };
+
+        let mut p = start;
+        while p + 6 + 44 <= end {
+            if data[p] > 1
+                || data[p + 1] != 0x02
+                || !(400..=800).contains(&rd(p + 2))
+                || rd(p + 4) != 11
+            {
+                p += 1;
+                continue;
+            }
+            let axis: Vec<i16> = (0..11).map(|k| rds(p + 6 + k * 2)).collect();
+            let curve: Vec<u16> = (0..11).map(|k| rd(p + 28 + k * 2)).collect();
+            if !axis.windows(2).all(|w| w[0] < w[1])
+                || !axis.contains(&0)
+                || !curve.windows(2).all(|w| w[0] >= w[1])
+                || curve[0] <= curve[10]
+            {
+                p += 1;
+                continue;
+            }
+            let mut maps = vec![switch(
+                p,
+                "Lambda sensor (LSU) enable switch",
+                "Wide-band lambda sensor: 0 = off, 1 = on",
+            )];
+            let hi = (p + 0x600).min(end.saturating_sub(4));
+            if let Some(q) = (p + 2..hi).find(|&q| {
+                data[q] <= 1 && data[q + 1] == 0x02 && (2731..=3731).contains(&rd(q + 2))
+            }) {
+                maps.push(switch(
+                    q,
+                    "Lambda sensor adaption switch",
+                    "Lambda sensor adaption: 0 = off, 1 = on",
+                ));
+            }
+            log::debug!("✅ [EDC16U34] Found lambda sensor switches at 0x{:X}", p);
+            return maps;
+        }
+        Vec::new()
+    }
+
+    /// Consignes de ralenti en courbes 1x4 sur la pression atmosphérique
+    /// [0004][pression hPa 4][régime 4] (réf. XDF 03G906016AB 376708) :
+    ///  - moteur chaud (0x1E22D0) : suivie immédiatement de la carte froide
+    ///    [r][0004][température r][même axe pression][r×4] — c'est ce qui
+    ///    l'identifie ;
+    ///  - démarrage (« drive-away », 0x1E1CFE) : même forme et exactement le
+    ///    même axe pression, à moins de 0x2000 octets de la consigne chaude.
+    /// Renvoie aussi l'adresse des données de la carte froide.
+    fn detect_idle_setpoint_curves(
+        &self,
+        data: &[u8],
+        start: usize,
+        end: usize,
+    ) -> (Vec<DetectedMap>, Option<u32>) {
+        const N: usize = 4;
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let end = end.min(data.len());
+        // [0004][axe pression][4 régimes] → (axe, données)
+        let curve_at = |p: usize| -> Option<(Vec<u16>, usize)> {
+            if p + 2 + 4 * N > end || rd(p) as usize != N {
+                return None;
+            }
+            let axis: Vec<u16> = (0..N).map(|k| rd(p + 2 + k * 2)).collect();
+            let d0 = p + 2 + N * 2;
+            let ok = axis.windows(2).all(|w| w[0] < w[1])
+                && (500..=800).contains(&axis[0])
+                && (900..=1100).contains(&axis[N - 1])
+                && (0..N).all(|k| (500..=1500).contains(&rd(d0 + k * 2)));
+            ok.then_some((axis, d0))
+        };
+        let curve = |name: &str, d0: usize, description: &str| {
+            let mut m = DetectedMap::new(
+                d0 as u32,
+                N * 2,
+                MapDimensions::OneDimensional { length: N },
+                DataType::UInt16,
+            );
+            m.name = Some(name.to_string());
+            m.category = Some("Idle speed RPM".to_string());
+            m.unit = Some("rpm".to_string());
+            m.correction_factor = Some(1.0);
+            m.offset = Some(0.0);
+            m.x_axis_address = Some((d0 - N * 2) as u32);
+            m.x_label = Some("Atm pressure (mbar)".to_string());
+            m.x_axis_correction = Some(1.0);
+            m.x_axis_offset = Some(0.0);
+            m.description = Some(description.to_string());
+            m.confidence = 0.9;
+            m
+        };
+
+        let mut p = start;
+        while p + 2 + 4 * N + 4 <= end {
+            let Some((axis, d0)) = curve_at(p) else {
+                p += 2;
+                continue;
+            };
+            // Carte froide collée derrière, sur le même axe pression
+            let h = d0 + N * 2;
+            let rows = rd(h) as usize;
+            let cold_axis = h + 4 + rows * 2;
+            if !(2..=6).contains(&rows)
+                || rd(h + 2) as usize != N
+                || cold_axis + N * 2 > end
+                || (0..N).any(|k| rd(cold_axis + k * 2) != axis[k])
+            {
+                p += 2;
+                continue;
+            }
+            let cold_data = (cold_axis + N * 2) as u32;
+            let mut maps = vec![curve(
+                "Idle speed setpoint warm engine",
+                d0,
+                "Idle speed setpoint, warm engine (rpm) | X: Atm pressure (mbar)",
+            )];
+            let lo = p.saturating_sub(0x2000).max(start);
+            let hi = (p + 0x2000).min(end);
+            if let Some(q) = (lo..hi).step_by(2).filter(|&q| q != p).find(|&q| {
+                curve_at(q).map_or(false, |(a, _)| a == axis)
+            }) {
+                maps.push(curve(
+                    "Idle speed setpoint drive-away",
+                    q + 2 + N * 2,
+                    "Idle speed setpoint while pulling away (rpm) | X: Atm pressure (mbar)",
+                ));
+            }
+            log::debug!("✅ [EDC16U34] Found idle speed setpoint curves at 0x{:X}", d0);
+            return (maps, Some(cold_data));
+        }
+        (Vec::new(), None)
     }
 
     /// Extras de parité avec la référence (réfs des 24 fichiers du banc) :
@@ -6584,8 +7401,15 @@ impl EDC16U34Detector {
                 }
             }
 
+            // Une limitation lambda mise à zéro (sonde coupée par la
+            // préparation, immo-ON-BAK sur 03G906016AB) reste la map : en-tête
+            // et axes ont déjà été validés, on la montre vide plutôt que de
+            // la faire disparaître.
+            let zeroed_lambda = map_name == "Smoke Limiter by Lambda"
+                && data[data_addr..data_addr + data_size].iter().all(|&b| b == 0);
+
             // At least 70% of data should be valid (relaxed for mixed maps)
-            if valid_data_count < (total_data_count * 70 / 100) {
+            if valid_data_count < (total_data_count * 70 / 100) && !zeroed_lambda {
                 continue;
             }
 
@@ -7817,7 +8641,11 @@ impl EDC16U34Detector {
         // This handles maps in lower address ranges (0x10000-0x180000)
         let mut legacy_candidates: Vec<(usize, usize, Vec<u16>, bool)> = Vec::new();
 
-        for i in 0x10000..0x180000.min(data.len().saturating_sub(100)) {
+        // Bornée à la zone de calibration : sur un 2 Mo, 0x10000-0x180000
+        // est du code (faux « EGR hysteresis 6 » à 0x4BC9A sur immo-ON-BAK,
+        // 03G906016AB) ; la boucle ne tourne plus que sur les dumps plus petits.
+        let (legacy_lo, _) = self.get_data_section_range(data.len());
+        for i in legacy_lo.max(0x10000)..0x180000.min(data.len().saturating_sub(100)) {
             // Check for 1D map header [00 14] = 20 columns
             if i + 1 >= data.len() || data[i] != 0x00 || data[i + 1] != 0x14 {
                 continue;
@@ -8277,17 +9105,23 @@ impl EDC16U34Detector {
             map.offset = Some(0.0);
             map.confidence = 0.88;
 
-            // X axis (temperature)
-            map.x_axis_address = Some(x_axis_start as u32);
-            map.x_label = Some("Engine temp".to_string());
-            map.x_axis_correction = Some(0.1);  // Kelvin*10 to Kelvin
-            map.x_axis_offset = Some(-273.15); // Kelvin to Celsius
+            // Premier axe (`rows` températures d'eau) = lignes → Y ; second
+            // axe (`cols` = 4 valeurs 700..950) = colonnes → X. Ce second axe
+            // est la pression atmosphérique en hPa, pas un régime (réf. XDF
+            // 03G906016AB 376708 : 0x1E22EA et 0x1E7B06). Ils étaient
+            // inversés, l'axe à 3 points servant aux 4 colonnes.
+            map.y_axis_address = Some(x_axis_start as u32);
+            map.y_label = Some("Coolant temp (°C)".to_string());
+            map.y_axis_correction = Some(0.1);
+            map.y_axis_offset = Some(-273.14);
 
-            // Y axis
-            map.y_axis_address = Some(y_axis_start as u32);
-            map.y_label = Some("rpm".to_string());
-            map.y_axis_correction = Some(1.0);
-            map.y_axis_offset = Some(0.0);
+            map.x_axis_address = Some(y_axis_start as u32);
+            map.x_label = Some("Atm pressure (mbar)".to_string());
+            map.x_axis_correction = Some(1.0);
+            map.x_axis_offset = Some(0.0);
+            map.description = Some(
+                "Idle speed setpoint (rpm) | X: Atm pressure (mbar) | Y: Coolant temp (°C)".to_string(),
+            );
 
             maps.push(map);
         }
@@ -8940,5 +9774,107 @@ mod tests {
         let template = MAP_TEMPLATES.iter().find(|t| t.name == "Boost Limiter").unwrap();
         assert!(template.z_range_tuned.1 > template.z_range_stock.1,
                 "Tuned mode should have extended range");
+    }
+
+    fn put_u16(buf: &mut Vec<u8>, values: &[u16]) {
+        for v in values {
+            buf.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    /// Bloc de correction altitude tel que sur 03G906016AB 376708 :
+    /// 6 maps 16x14, axes partagés, sélecteur sur la pression atmosphérique.
+    #[test]
+    fn test_soi_altitude_correction_block() {
+        let rpm = [100u16, 800, 1000, 1250, 1500, 1750, 2000, 2250, 2500, 2750, 3000, 3250, 3500, 4000, 4500, 5000];
+        let iq = [0u16, 500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5500, 6000];
+        let mut data = vec![0xFFu8; 0x100];
+        let base = data.len();
+        put_u16(&mut data, &vec![234u16; 6 * 16 * 14]);
+        put_u16(&mut data, &[16]);
+        put_u16(&mut data, &rpm);
+        put_u16(&mut data, &[14]);
+        put_u16(&mut data, &iq);
+        put_u16(&mut data, &[6, 600, 613, 650, 700, 800, 915]);
+        let selector = data.len();
+        put_u16(&mut data, &[0, 0x100, 0x200, 0x300, 0x400, 0x500]);
+        data.extend_from_slice(&[0xFF; 0x100]);
+
+        let detector = EDC16U34Detector::new(EDC16Variant::EDC16U34);
+        let maps = detector.detect_soi_correction_blocks(&data, 0, data.len(), &HashSet::new());
+        assert_eq!(maps.len(), 7);
+        assert_eq!(maps[0].address as usize, base);
+        assert_eq!(maps[0].name.as_deref(), Some("Start of injection altitude correction 00"));
+        assert_eq!(maps[5].address as usize, base + 5 * 448);
+        assert_eq!(maps[6].address as usize, selector);
+        assert_eq!(maps[6].name.as_deref(), Some("SOI altitude correction selector"));
+
+        // Sélecteur hors bornes (index 6 sur 6 maps) : pas un bloc
+        let off = selector + 10;
+        data[off..off + 2].copy_from_slice(&0x600u16.to_be_bytes());
+        let maps = detector.detect_soi_correction_blocks(&data, 0, data.len(), &HashSet::new());
+        assert!(maps.is_empty());
+    }
+
+    /// Consigne chaude 1x4 suivie de la carte froide sur le même axe
+    /// pression, et courbe de démarrage à l'axe identique plus haut
+    /// (disposition 03G906016AB 376708).
+    #[test]
+    fn test_idle_setpoint_curves() {
+        let hpa = [700u16, 850, 900, 950];
+        let mut data = vec![0xFFu8; 0x40];
+        put_u16(&mut data, &[4]);
+        put_u16(&mut data, &hpa);
+        let drive_away = data.len();
+        put_u16(&mut data, &[903, 860, 830, 830, 930]);
+        data.extend_from_slice(&[0xFF; 0x100]);
+        put_u16(&mut data, &[4]);
+        put_u16(&mut data, &hpa);
+        let warm = data.len();
+        put_u16(&mut data, &[903, 860, 830, 830, 3, 4, 2531, 2731, 2931]);
+        put_u16(&mut data, &hpa);
+        let cold = data.len();
+        put_u16(&mut data, &[1400; 12]);
+        data.extend_from_slice(&[0xFF; 0x40]);
+
+        let detector = EDC16U34Detector::new(EDC16Variant::EDC16U34);
+        let (maps, cold_idle) = detector.detect_idle_setpoint_curves(&data, 0, data.len());
+        assert_eq!(cold_idle, Some(cold as u32));
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps[0].address as usize, warm);
+        assert_eq!(maps[0].name.as_deref(), Some("Idle speed setpoint warm engine"));
+        assert_eq!(maps[1].address as usize, drive_away);
+
+        // Sans carte froide derrière, aucune courbe n'est retenue
+        data[warm + 8..warm + 10].copy_from_slice(&9u16.to_be_bytes());
+        let (maps, cold_idle) = detector.detect_idle_setpoint_curves(&data, 0, data.len());
+        assert!(maps.is_empty() && cold_idle.is_none());
+    }
+
+    /// Driver wish inverse 12x16 ; la même forme en 16x16 (map de swirl)
+    /// n'est pas retenue.
+    #[test]
+    fn test_inverse_driver_wish_grid() {
+        let rpm = [0u16, 399, 609, 840, 1008, 1491, 1995, 2499, 3003, 3990, 4998, 5355];
+        let nm: Vec<u16> = (0..16).map(|i| i * 240).collect();
+        let row: Vec<u16> = (0..16).map(|i| i * 600).collect();
+        let mut data = vec![0xFFu8; 0x40];
+        put_u16(&mut data, &[12, 16]);
+        put_u16(&mut data, &rpm);
+        put_u16(&mut data, &nm);
+        let d0 = data.len();
+        for _ in 0..12 {
+            put_u16(&mut data, &row);
+        }
+        data.extend_from_slice(&[0xFF; 0x40]);
+
+        let detector = EDC16U34Detector::new(EDC16Variant::EDC16U34);
+        let maps = detector.detect_inverse_driver_wish(&data, 0, data.len(), &HashSet::new());
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].address as usize, d0);
+
+        data[0x40..0x42].copy_from_slice(&16u16.to_be_bytes());
+        let maps = detector.detect_inverse_driver_wish(&data, 0, data.len(), &HashSet::new());
+        assert!(maps.is_empty());
     }
 }

@@ -24,7 +24,9 @@
 //! exigeait BP = L = 1, ne trouvait pas.
 //!
 //! Le motif accepte donc 0 ou 1 sur BP et L, avec le reste inchangé :
-//! `[0|1] 00 02 00 [0|1] 00 [0|1] 0A DD 00`. Relevé sur le banc EDC16 :
+//! `[0|1] 00 02 00 [0|1] [0|1] [0|1] 0A DD 00`. S accepte aussi 1 : une
+//! préparation qui coupe la sonde lambda le passe à 1 (immo-ON-BAK sur
+//! 03G906016AB 376708), et les deux switchs n'étaient plus trouvés. Relevé sur le banc EDC16 :
 //! 94 des 116 U1, 7 des 17 U31, 196 des 196 U34, jamais plus de deux
 //! occurrences par fichier (une par bloc de calibration), et l'adresse
 //! trouvée est celle des définitions WinOLS sur les dix packs U1 qui la
@@ -42,29 +44,33 @@ use crate::models::{DataType, DetectedMap, MapDimensions};
 const PATTERN_LEN: usize = 10;
 /// Position du switch lambda/cartes dans le motif.
 const LAMBDA_OFFSET: usize = 4;
+/// Position du switch carte de fumée normale / espace 4D dans le motif.
+const SMOKE_SPACE_OFFSET: usize = 5;
 /// Position du switch MAF/MAP dans le motif.
 const MAP_MAF_OFFSET: usize = 6;
 
 /// Ajoute les switchs MAF/MAP et lambda/cartes pour chaque exemplaire trouvé
 /// (un par bloc de calibration sur les fichiers qui en ont deux).
+/// `with_smoke_space` ajoute le switch S (EDC16U34, réf. XDF 03G906016AB).
 pub fn detect_smoke_switches(
     data: &[u8],
     maps: &mut Vec<DetectedMap>,
     detected_addresses: &mut HashSet<u32>,
+    with_smoke_space: bool,
 ) {
     if data.len() < PATTERN_LEN {
         return;
     }
 
     for i in 0..=data.len() - PATTERN_LEN {
-        // BP, un zéro, la constante 02 00, L, un zéro, MM, puis la queue
-        // 0A DD 00 : dix octets dont trois sont des switchs à 0 ou 1.
+        // BP, un zéro, la constante 02 00, L, S, MM, puis la queue
+        // 0A DD 00 : dix octets dont quatre sont des switchs à 0 ou 1.
         if data[i] > 1
             || data[i + 1] != 0x00
             || data[i + 2] != 0x02
             || data[i + 3] != 0x00
             || data[i + LAMBDA_OFFSET] > 1
-            || data[i + 5] != 0x00
+            || data[i + SMOKE_SPACE_OFFSET] > 1
             || data[i + MAP_MAF_OFFSET] > 1
             || data[i + 7] != 0x0A
             || data[i + 8] != 0xDD
@@ -89,6 +95,16 @@ pub fn detect_smoke_switches(
             "MAP/MAF switch",
             "Sensor used by the smoke limitation: 0 = MAF, 1 = MAP",
         );
+        if with_smoke_space {
+            push_switch(
+                data,
+                maps,
+                detected_addresses,
+                i + SMOKE_SPACE_OFFSET,
+                "Smoke space map switch",
+                "Smoke limitation map: 0 = normal smoke map, 1 = 4-D smoke space",
+            );
+        }
     }
 }
 
@@ -140,7 +156,7 @@ mod tests {
     fn run(data: &[u8]) -> Vec<DetectedMap> {
         let mut maps = Vec::new();
         let mut seen = HashSet::new();
-        detect_smoke_switches(data, &mut maps, &mut seen);
+        detect_smoke_switches(data, &mut maps, &mut seen, false);
         maps
     }
 
@@ -175,6 +191,24 @@ mod tests {
         assert_eq!(maps.len(), 2);
         assert_eq!(named(&maps, "Lambda/smoke maps switch"), Some(0x104));
         assert_eq!(named(&maps, "MAP/MAF switch"), Some(0x106));
+    }
+
+    #[test]
+    fn finds_the_switches_with_the_smoke_space_set() {
+        // S = 1 : préparation sonde lambda coupée (immo-ON-BAK, 03G906016AB)
+        let data = file_with(
+            &[0x01, 0x00, 0x02, 0x00, 0x01, 0x01, 0x01, 0x0A, 0xDD, 0x00],
+            0x300,
+        );
+        let maps = run(&data);
+        assert_eq!(maps.len(), 2);
+        assert_eq!(named(&maps, "MAP/MAF switch"), Some(0x306));
+
+        let mut maps = Vec::new();
+        let mut seen = HashSet::new();
+        detect_smoke_switches(&data, &mut maps, &mut seen, true);
+        assert_eq!(maps.len(), 3);
+        assert_eq!(named(&maps, "Smoke space map switch"), Some(0x305));
     }
 
     #[test]
@@ -219,7 +253,7 @@ mod tests {
         );
         let mut maps = Vec::new();
         let mut seen = HashSet::from([0x306u32]);
-        detect_smoke_switches(&data, &mut maps, &mut seen);
+        detect_smoke_switches(&data, &mut maps, &mut seen, false);
         assert_eq!(maps.len(), 1);
         assert_eq!(named(&maps, "Lambda/smoke maps switch"), Some(0x304));
     }

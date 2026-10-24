@@ -78,14 +78,20 @@ impl MapDetector {
 
         // Famille pour la normalisation des axes : le type forcé par l'appelant
         // prime, sinon l'identification automatique.
-        let family = match forced_for_family.unwrap_or(result.ecu_identification.ecu_type.clone()) {
+        let effective_type = forced_for_family.unwrap_or(result.ecu_identification.ecu_type.clone());
+        let family = match effective_type {
             ECUType::EDC15P | ECUType::EDC15V => "EDC15P",
             ECUType::EDC15VM => "EDC15VM",
             _ if is_edc16 => "EDC16",
             _ => "",
         };
 
-        Self::finalize_maps(result.maps, is_edc16, family)
+        // EDC16U34 : MAF linearisation, driver wish inverse et pause minimale
+        // après l'injection principale restent affichées (réf. XDF complète
+        // 03G906016AB 376708 : même adresse, même grille, mêmes facteurs).
+        let show_extras = matches!(effective_type, ECUType::EDC16U34);
+
+        Self::finalize_maps(result.maps, is_edc16, family, show_extras)
     }
 
     /// Libellés, facteurs et unités d'axes : corrections centralisées, par
@@ -224,7 +230,16 @@ impl MapDetector {
     ///   Injection system — demande des utilisateurs) ;
     /// - EDC16 : dossier « Fuel Correction » reversé dans « Injection
     ///   system », dossiers « Airflow » et « DPF » reversés dans « Other ».
-    fn finalize_maps(maps: Vec<DetectedMap>, is_edc16: bool, family: &str) -> Vec<DetectedMap> {
+    ///
+    /// `show_extras` (EDC16U34) garde les trois maps masquées ci-dessus :
+    /// « Inverse driver wish », « MAF linearisation » et « Duration min.
+    /// injection break after main injection ».
+    fn finalize_maps(
+        maps: Vec<DetectedMap>,
+        is_edc16: bool,
+        family: &str,
+        show_extras: bool,
+    ) -> Vec<DetectedMap> {
         let mut out: Vec<DetectedMap> = Vec::with_capacity(maps.len());
         for mut map in maps {
             if let Some(name) = map.name.take() {
@@ -239,8 +254,9 @@ impl MapDetector {
             let lower = map.name.as_deref().unwrap_or("").to_ascii_lowercase();
 
             // Masquées partout
-            if (lower.contains("inverse") && lower.contains("driver"))
-                || lower.contains("maf linearisation")
+            if !show_extras
+                && ((lower.contains("inverse") && lower.contains("driver"))
+                    || lower.contains("maf linearisation"))
             {
                 continue;
             }
@@ -248,6 +264,7 @@ impl MapDetector {
             // EDC16 : ne garder que Duration 00-05 + Duration Selector
             if is_edc16 && lower.starts_with("duration") {
                 let keep = lower.starts_with("duration selector")
+                    || (show_extras && lower.starts_with("duration min. injection break"))
                     || (lower.starts_with("duration 0")
                         && lower
                             .as_bytes()
