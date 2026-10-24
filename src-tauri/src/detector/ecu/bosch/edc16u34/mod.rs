@@ -797,6 +797,10 @@ impl EDC16U34Detector {
         let mut late_maps =
             self.detect_soi_correction_blocks(data, scan_start, scan_end, &kept_ranges);
         late_maps.extend(self.detect_inverse_driver_wish(data, scan_start, scan_end, &kept_ranges));
+        late_maps.extend(self.detect_n75_duty_limits(data, scan_start, scan_end, &kept_ranges));
+        late_maps.extend(self.detect_substitute_air_mass(data, scan_start, scan_end, &kept_ranges));
+        late_maps.extend(self.detect_pressure_scale_factors(data, scan_start, scan_end));
+        late_maps.extend(self.detect_lambda_sensor_switches(data, scan_start, scan_end));
         {
             let driver_wish: Vec<&DetectedMap> = all_maps
                 .iter()
@@ -845,7 +849,7 @@ impl EDC16U34Detector {
         // sélecteurs ne doit pas les recevoir deux fois.
         {
             let mut seen: HashSet<u32> = all_maps.iter().map(|m| m.address).collect();
-            super::map_maf_switch::detect_smoke_switches(data, &mut all_maps, &mut seen);
+            super::map_maf_switch::detect_smoke_switches(data, &mut all_maps, &mut seen, true);
         }
 
         Self::normalize_boost_names(&mut all_maps);
@@ -5580,6 +5584,309 @@ impl EDC16U34Detector {
         maps
     }
 
+    /// Bornes du rapport cyclique N75, rangées à la suite de la courbe de
+    /// linéarisation du rapport cyclique (0x1E5852 sur 03G906016AB 376708) :
+    ///   [N][axe % 0..100 N][linéarisation N]
+    ///   [R][10][régime R][IQ 10][maximum R×10]   (16x10, 0x1E58B4)
+    ///   [R][10][régime R][IQ 10][minimum R×10]   (6x10, 0x1E5A18)
+    /// Une préparation relève le maximum (70 → 95 %) et met le minimum à 0
+    /// (immo-ON-BAK).
+    fn detect_n75_duty_limits(
+        &self,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        detected_ranges: &HashSet<(u32, u32)>,
+    ) -> Vec<DetectedMap> {
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let increasing = |v: &[u16]| v.windows(2).all(|w| w[0] < w[1]);
+        let end = end.min(data.len());
+        // [R][C][régime R][IQ C][R×C cellules ≤ 100 %] → (début des données, R, C, fin)
+        let read_map = |h: usize| -> Option<(usize, usize, usize, usize)> {
+            if h + 4 > end {
+                return None;
+            }
+            let (rows, cols) = (rd(h) as usize, rd(h + 2) as usize);
+            if !(4..=16).contains(&rows) || !(6..=12).contains(&cols) {
+                return None;
+            }
+            let y0 = h + 4;
+            let x0 = y0 + rows * 2;
+            let d0 = x0 + cols * 2;
+            let d1 = d0 + rows * cols * 2;
+            if d1 > end {
+                return None;
+            }
+            let y: Vec<u16> = (0..rows).map(|k| rd(y0 + k * 2)).collect();
+            let x: Vec<u16> = (0..cols).map(|k| rd(x0 + k * 2)).collect();
+            let ok = increasing(&y)
+                && y[0] <= 1000
+                && (3000..=6000).contains(&y[rows - 1])
+                && increasing(&x)
+                && x[0] <= 700
+                && (1500..=8000).contains(&x[cols - 1])
+                && (d0..d1).step_by(2).all(|o| rd(o) <= 10000);
+            ok.then_some((d0, rows, cols, d1))
+        };
+
+        let mut p = start;
+        while p + 4 < end {
+            let n = rd(p) as usize;
+            if !(11..=25).contains(&n) || p + 2 + n * 4 + 4 > end {
+                p += 2;
+                continue;
+            }
+            let a0 = p + 2;
+            let axis: Vec<u16> = (0..n).map(|k| rd(a0 + k * 2)).collect();
+            if axis[0] != 0 || axis[n - 1] != 10000 || !increasing(&axis) {
+                p += 2;
+                continue;
+            }
+            let l0 = a0 + n * 2;
+            let Some(max) = read_map(l0 + n * 2) else {
+                p += 2;
+                continue;
+            };
+            let Some(min) = read_map(max.3) else {
+                p += 2;
+                continue;
+            };
+
+            let mut maps = Vec::new();
+            for ((d0, rows, cols, _), name, what) in [
+                (max, "N75 max allowed duty cycle", "Maximum"),
+                (min, "N75 min allowed duty cycle", "Minimum"),
+            ] {
+                let size = rows * cols * 2;
+                if self.overlaps(detected_ranges, (d0 as u32, (d0 + size) as u32)) {
+                    continue;
+                }
+                let x0 = d0 - cols * 2;
+                let y0 = x0 - rows * 2;
+                let mut m = DetectedMap::new(
+                    d0 as u32,
+                    size,
+                    MapDimensions::TwoDimensional { rows, cols },
+                    DataType::UInt16,
+                );
+                m.name = Some(name.to_string());
+                m.category =
+                    Some(MapCategory::TurboBoostPressureControl.display_name().to_string());
+                m.unit = Some("%".to_string());
+                m.correction_factor = Some(0.01);
+                m.y_axis_address = Some(y0 as u32);
+                m.y_label = Some("Engine speed (rpm)".to_string());
+                m.y_axis_correction = Some(1.0);
+                m.x_axis_address = Some(x0 as u32);
+                m.x_label = Some("IQ (mg/stroke)".to_string());
+                m.x_axis_correction = Some(0.01);
+                m.description = Some(format!(
+                    "{} N75 duty cycle allowed (%) | X: IQ (mg/stroke) | Y: Engine speed (rpm)",
+                    what
+                ));
+                m.confidence = 0.9;
+                log::debug!("✅ [EDC16U34] Found {} ({}x{}) at 0x{:X}", name, rows, cols, d0);
+                maps.push(m);
+            }
+            return maps;
+        }
+        Vec::new()
+    }
+
+    /// Masse d'air de substitution quand le débitmètre est en défaut :
+    /// 8x8 [0008][0008][régime depuis 0][pression atmo → suralimentation]
+    /// [masse d'air mg ×0.1] (0x1C3A60 sur 03G906016AB 376708 : 550 mg
+    /// d'origine, 1250 mg sur la préparation immo-ON-BAK). La map de
+    /// limitation du gouverneur lambda a le même en-tête mais un axe X qui
+    /// part de 1000 et des cellules en %.
+    fn detect_substitute_air_mass(
+        &self,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        detected_ranges: &HashSet<(u32, u32)>,
+    ) -> Option<DetectedMap> {
+        const N: usize = 8;
+        const SIZE: usize = N * N * 2;
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let end = end.min(data.len());
+        let mut p = start;
+        while p + 4 + 4 * N + SIZE <= end {
+            if rd(p) as usize != N || rd(p + 2) as usize != N {
+                p += 2;
+                continue;
+            }
+            let y0 = p + 4;
+            let x0 = y0 + N * 2;
+            let d0 = x0 + N * 2;
+            let y: Vec<u16> = (0..N).map(|k| rd(y0 + k * 2)).collect();
+            let x: Vec<u16> = (0..N).map(|k| rd(x0 + k * 2)).collect();
+            let ok = y[0] == 0
+                && (3000..=5000).contains(&y[N - 1])
+                && y.windows(2).all(|w| w[0] < w[1])
+                && (600..=900).contains(&x[0])
+                && (2000..=3500).contains(&x[N - 1])
+                && x.windows(2).all(|w| w[0] < w[1])
+                && (d0..d0 + SIZE).step_by(2).all(|o| (1000..=20000).contains(&rd(o)));
+            if !ok || self.overlaps(detected_ranges, (d0 as u32, (d0 + SIZE) as u32)) {
+                p += 2;
+                continue;
+            }
+            let mut m = DetectedMap::new(
+                d0 as u32,
+                SIZE,
+                MapDimensions::TwoDimensional { rows: N, cols: N },
+                DataType::UInt16,
+            );
+            m.name = Some("Substitute air mass on MAF error".to_string());
+            m.category = Some(MapCategory::AirControl.display_name().to_string());
+            m.unit = Some("mg/stroke".to_string());
+            m.correction_factor = Some(0.1);
+            m.y_axis_address = Some(y0 as u32);
+            m.y_label = Some("Engine speed (rpm)".to_string());
+            m.y_axis_correction = Some(1.0);
+            m.x_axis_address = Some(x0 as u32);
+            m.x_label = Some("Boost pressure (mbar)".to_string());
+            m.x_axis_correction = Some(1.0);
+            m.description = Some(
+                "Air mass used when the MAF sensor is faulty (mg/stroke) | X: Boost pressure (mbar) | Y: Engine speed (rpm)"
+                    .to_string(),
+            );
+            m.confidence = 0.9;
+            log::debug!("✅ [EDC16U34] Found Substitute air mass on MAF error at 0x{:X}", d0);
+            return Some(m);
+        }
+        None
+    }
+
+    /// Facteurs d'échelle de la pression de suralimentation vers le
+    /// diagnostic (DSM et interface diagnostic, ×0.0001). Une préparation
+    /// avec capteur MAP plus gros les réécrit avec la MAP linearisation
+    /// (0.098 → 0.0857 sur immo-ON-BAK). Table des conversions [offset]
+    /// [échelle] DSM/CAN/diag ; repère : l'échelle diag de la pression FAP
+    /// [0080][0F52], puis un triplet neutre [0000 2710]×3, puis le triplet
+    /// pression [0000][S][0000][2710][0000][S] (0x1C1280 sur 03G906016AB).
+    fn detect_pressure_scale_factors(&self, data: &[u8], start: usize, end: usize) -> Vec<DetectedMap> {
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let end = end.min(data.len());
+        let neutral = |o: usize| (0..3).all(|k| rd(o + k * 4) == 0 && rd(o + k * 4 + 2) == 10000);
+        let mut p = start;
+        while p + 4 + 12 + 12 <= end {
+            if rd(p) != 0x0080 || rd(p + 2) != 0x0F52 || !neutral(p + 4) {
+                p += 2;
+                continue;
+            }
+            let t = p + 16;
+            let (dsm, dia) = (rd(t + 2), rd(t + 10));
+            if rd(t) != 0
+                || rd(t + 4) != 0
+                || rd(t + 6) != 10000
+                || rd(t + 8) != 0
+                || !(100..=10000).contains(&dsm)
+                || !(100..=10000).contains(&dia)
+            {
+                p += 2;
+                continue;
+            }
+            let mut maps = Vec::new();
+            for (at, name) in [
+                (t + 2, "Boost pressure scale factor (DSM)"),
+                (t + 10, "Boost pressure scale factor (diagnostic)"),
+            ] {
+                let mut m = DetectedMap::new(
+                    at as u32,
+                    2,
+                    MapDimensions::TwoDimensional { rows: 1, cols: 1 },
+                    DataType::UInt16,
+                );
+                m.name = Some(name.to_string());
+                m.category = Some("MAP Sensor".to_string());
+                m.unit = Some("-".to_string());
+                m.correction_factor = Some(0.0001);
+                m.offset = Some(0.0);
+                m.description = Some(
+                    "Scale of the boost pressure sent to diagnostics; change it with the MAP linearisation"
+                        .to_string(),
+                );
+                m.confidence = 0.9;
+                maps.push(m);
+            }
+            log::debug!("✅ [EDC16U34] Found boost pressure scale factors at 0x{:X}", t + 2);
+            return maps;
+        }
+        Vec::new()
+    }
+
+    /// Switchs de la sonde lambda large bande (switchs logiciels Bosch :
+    /// [valeur 0|1][type 02]) :
+    ///  - activation LSU : suivi de la tension batterie minimale puis de la
+    ///    courbe lambda réciproque [000B][courant de pompe signé croissant 11]
+    ///    [11 valeurs décroissantes] (0x1E23F0 sur 03G906016AB 376708) ;
+    ///  - adaptation : premier [0|1][02][température d'air 0..100 °C] dans
+    ///    les 0x600 octets suivants (0x1E251A).
+    /// Une préparation sonde coupée met les deux à 0 (immo-ON-BAK).
+    fn detect_lambda_sensor_switches(&self, data: &[u8], start: usize, end: usize) -> Vec<DetectedMap> {
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let rds = |o: usize| rd(o) as i16;
+        let end = end.min(data.len());
+        let switch = |at: usize, name: &str, description: &str| {
+            let mut m = DetectedMap::new(
+                at as u32,
+                1,
+                MapDimensions::TwoDimensional { rows: 1, cols: 1 },
+                DataType::UInt8,
+            );
+            m.name = Some(name.to_string());
+            m.category = Some("Lambda sensor".to_string());
+            m.unit = Some("-".to_string());
+            m.correction_factor = Some(1.0);
+            m.offset = Some(0.0);
+            m.description = Some(description.to_string());
+            m.confidence = 0.9;
+            m
+        };
+
+        let mut p = start;
+        while p + 6 + 44 <= end {
+            if data[p] > 1
+                || data[p + 1] != 0x02
+                || !(400..=800).contains(&rd(p + 2))
+                || rd(p + 4) != 11
+            {
+                p += 1;
+                continue;
+            }
+            let axis: Vec<i16> = (0..11).map(|k| rds(p + 6 + k * 2)).collect();
+            let curve: Vec<u16> = (0..11).map(|k| rd(p + 28 + k * 2)).collect();
+            if !axis.windows(2).all(|w| w[0] < w[1])
+                || !axis.contains(&0)
+                || !curve.windows(2).all(|w| w[0] >= w[1])
+                || curve[0] <= curve[10]
+            {
+                p += 1;
+                continue;
+            }
+            let mut maps = vec![switch(
+                p,
+                "Lambda sensor (LSU) enable switch",
+                "Wide-band lambda sensor: 0 = off, 1 = on",
+            )];
+            let hi = (p + 0x600).min(end.saturating_sub(4));
+            if let Some(q) = (p + 2..hi).find(|&q| {
+                data[q] <= 1 && data[q + 1] == 0x02 && (2731..=3731).contains(&rd(q + 2))
+            }) {
+                maps.push(switch(
+                    q,
+                    "Lambda sensor adaption switch",
+                    "Lambda sensor adaption: 0 = off, 1 = on",
+                ));
+            }
+            log::debug!("✅ [EDC16U34] Found lambda sensor switches at 0x{:X}", p);
+            return maps;
+        }
+        Vec::new()
+    }
+
     /// Extras de parité avec la référence (réfs des 24 fichiers du banc) :
     /// - « Fuel Volume Correction » 9x8 [0009][0008] + « Expected Fuel
     ///   Temp » 8x8 [0008][0008] : paire adjacente (0x1DEEA6/0x1DEFAE sur
@@ -6969,8 +7276,15 @@ impl EDC16U34Detector {
                 }
             }
 
+            // Une limitation lambda mise à zéro (sonde coupée par la
+            // préparation, immo-ON-BAK sur 03G906016AB) reste la map : en-tête
+            // et axes ont déjà été validés, on la montre vide plutôt que de
+            // la faire disparaître.
+            let zeroed_lambda = map_name == "Smoke Limiter by Lambda"
+                && data[data_addr..data_addr + data_size].iter().all(|&b| b == 0);
+
             // At least 70% of data should be valid (relaxed for mixed maps)
-            if valid_data_count < (total_data_count * 70 / 100) {
+            if valid_data_count < (total_data_count * 70 / 100) && !zeroed_lambda {
                 continue;
             }
 
@@ -8202,7 +8516,11 @@ impl EDC16U34Detector {
         // This handles maps in lower address ranges (0x10000-0x180000)
         let mut legacy_candidates: Vec<(usize, usize, Vec<u16>, bool)> = Vec::new();
 
-        for i in 0x10000..0x180000.min(data.len().saturating_sub(100)) {
+        // Bornée à la zone de calibration : sur un 2 Mo, 0x10000-0x180000
+        // est du code (faux « EGR hysteresis 6 » à 0x4BC9A sur immo-ON-BAK,
+        // 03G906016AB) ; la boucle ne tourne plus que sur les dumps plus petits.
+        let (legacy_lo, _) = self.get_data_section_range(data.len());
+        for i in legacy_lo.max(0x10000)..0x180000.min(data.len().saturating_sub(100)) {
             // Check for 1D map header [00 14] = 20 columns
             if i + 1 >= data.len() || data[i] != 0x00 || data[i + 1] != 0x14 {
                 continue;

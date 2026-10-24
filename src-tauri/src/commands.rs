@@ -230,7 +230,13 @@ pub fn import_map_definitions(
 ///       wish inverse, MAF linearisation et pause minimale après la
 ///       principale affichées (cette dernière en µs, axe en °V) — réf. XDF
 ///       complète 03G906016AB 376708.
-pub const DETECTOR_VERSION: u32 = 51;
+///   52 — EDC16U34 : bornes N75 max/min, masse d'air de substitution,
+///       facteurs d'échelle de la pression de suralimentation, switchs de
+///       sonde lambda (LSU, adaptation) et switch d'espace de fumée ;
+///       limitations lambda mises à zéro et switchs de fumée retrouvés sur
+///       un fichier préparé ; plus de « EGR hysteresis » dans le code des
+///       2 Mo — réf. 03G906016AB d'origine / immo-ON-BAK.
+pub const DETECTOR_VERSION: u32 = 52;
 
 /// Version du moteur de détection, pour comparaison avec celle enregistrée
 /// dans un projet.
