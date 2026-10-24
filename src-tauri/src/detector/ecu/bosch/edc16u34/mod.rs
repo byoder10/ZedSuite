@@ -801,6 +801,39 @@ impl EDC16U34Detector {
         late_maps.extend(self.detect_substitute_air_mass(data, scan_start, scan_end, &kept_ranges));
         late_maps.extend(self.detect_pressure_scale_factors(data, scan_start, scan_end));
         late_maps.extend(self.detect_lambda_sensor_switches(data, scan_start, scan_end));
+        let (idle_curves, cold_idle) = self.detect_idle_setpoint_curves(data, scan_start, scan_end);
+        late_maps.extend(idle_curves);
+        if let Some(cold_idle) = cold_idle {
+            // Avec les courbes de consigne, le ralenti n'est pas un scalaire :
+            // les « Single value idle speed » trouvés par motif de valeurs
+            // sont d'autres paramètres (0x1E6714 temporisation d'erreur,
+            // 0x1E7B40 régime max de compensation au démarrage, XDF
+            // 03G906016AB). Et la carte 3x4 qui ne suit pas la consigne
+            // chaude est la coupure de démarreur (0x1E7B06).
+            all_maps.retain(|m| {
+                !m.name.as_deref().map_or(false, |n| n.starts_with("Single value idle speed"))
+            });
+            let mut idle_index = 0;
+            for m in all_maps.iter_mut() {
+                let is_idle_map = m.name.as_deref().map_or(false, |n| {
+                    n.starts_with("Idle speed correction by engine temp")
+                });
+                if !is_idle_map {
+                    continue;
+                }
+                if m.address == cold_idle {
+                    idle_index += 1;
+                    m.name = Some(format!("Idle speed correction by engine temp {}", idle_index));
+                } else {
+                    m.name = Some("Starting cut-out speed".to_string());
+                    m.category = Some("Other".to_string());
+                    m.description = Some(
+                        "Engine speed at which the starter is cut out (rpm) | X: Atm pressure (mbar) | Y: Coolant temp (°C)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
         {
             let driver_wish: Vec<&DetectedMap> = all_maps
                 .iter()
@@ -5887,6 +5920,98 @@ impl EDC16U34Detector {
         Vec::new()
     }
 
+    /// Consignes de ralenti en courbes 1x4 sur la pression atmosphérique
+    /// [0004][pression hPa 4][régime 4] (réf. XDF 03G906016AB 376708) :
+    ///  - moteur chaud (0x1E22D0) : suivie immédiatement de la carte froide
+    ///    [r][0004][température r][même axe pression][r×4] — c'est ce qui
+    ///    l'identifie ;
+    ///  - démarrage (« drive-away », 0x1E1CFE) : même forme et exactement le
+    ///    même axe pression, à moins de 0x2000 octets de la consigne chaude.
+    /// Renvoie aussi l'adresse des données de la carte froide.
+    fn detect_idle_setpoint_curves(
+        &self,
+        data: &[u8],
+        start: usize,
+        end: usize,
+    ) -> (Vec<DetectedMap>, Option<u32>) {
+        const N: usize = 4;
+        let rd = |o: usize| u16::from_be_bytes([data[o], data[o + 1]]);
+        let end = end.min(data.len());
+        // [0004][axe pression][4 régimes] → (axe, données)
+        let curve_at = |p: usize| -> Option<(Vec<u16>, usize)> {
+            if p + 2 + 4 * N > end || rd(p) as usize != N {
+                return None;
+            }
+            let axis: Vec<u16> = (0..N).map(|k| rd(p + 2 + k * 2)).collect();
+            let d0 = p + 2 + N * 2;
+            let ok = axis.windows(2).all(|w| w[0] < w[1])
+                && (500..=800).contains(&axis[0])
+                && (900..=1100).contains(&axis[N - 1])
+                && (0..N).all(|k| (500..=1500).contains(&rd(d0 + k * 2)));
+            ok.then_some((axis, d0))
+        };
+        let curve = |name: &str, d0: usize, description: &str| {
+            let mut m = DetectedMap::new(
+                d0 as u32,
+                N * 2,
+                MapDimensions::OneDimensional { length: N },
+                DataType::UInt16,
+            );
+            m.name = Some(name.to_string());
+            m.category = Some("Idle speed RPM".to_string());
+            m.unit = Some("rpm".to_string());
+            m.correction_factor = Some(1.0);
+            m.offset = Some(0.0);
+            m.x_axis_address = Some((d0 - N * 2) as u32);
+            m.x_label = Some("Atm pressure (mbar)".to_string());
+            m.x_axis_correction = Some(1.0);
+            m.x_axis_offset = Some(0.0);
+            m.description = Some(description.to_string());
+            m.confidence = 0.9;
+            m
+        };
+
+        let mut p = start;
+        while p + 2 + 4 * N + 4 <= end {
+            let Some((axis, d0)) = curve_at(p) else {
+                p += 2;
+                continue;
+            };
+            // Carte froide collée derrière, sur le même axe pression
+            let h = d0 + N * 2;
+            let rows = rd(h) as usize;
+            let cold_axis = h + 4 + rows * 2;
+            if !(2..=6).contains(&rows)
+                || rd(h + 2) as usize != N
+                || cold_axis + N * 2 > end
+                || (0..N).any(|k| rd(cold_axis + k * 2) != axis[k])
+            {
+                p += 2;
+                continue;
+            }
+            let cold_data = (cold_axis + N * 2) as u32;
+            let mut maps = vec![curve(
+                "Idle speed setpoint warm engine",
+                d0,
+                "Idle speed setpoint, warm engine (rpm) | X: Atm pressure (mbar)",
+            )];
+            let lo = p.saturating_sub(0x2000).max(start);
+            let hi = (p + 0x2000).min(end);
+            if let Some(q) = (lo..hi).step_by(2).filter(|&q| q != p).find(|&q| {
+                curve_at(q).map_or(false, |(a, _)| a == axis)
+            }) {
+                maps.push(curve(
+                    "Idle speed setpoint drive-away",
+                    q + 2 + N * 2,
+                    "Idle speed setpoint while pulling away (rpm) | X: Atm pressure (mbar)",
+                ));
+            }
+            log::debug!("✅ [EDC16U34] Found idle speed setpoint curves at 0x{:X}", d0);
+            return (maps, Some(cold_data));
+        }
+        (Vec::new(), None)
+    }
+
     /// Extras de parité avec la référence (réfs des 24 fichiers du banc) :
     /// - « Fuel Volume Correction » 9x8 [0009][0008] + « Expected Fuel
     ///   Temp » 8x8 [0008][0008] : paire adjacente (0x1DEEA6/0x1DEFAE sur
@@ -8980,17 +9105,23 @@ impl EDC16U34Detector {
             map.offset = Some(0.0);
             map.confidence = 0.88;
 
-            // X axis (temperature)
-            map.x_axis_address = Some(x_axis_start as u32);
-            map.x_label = Some("Engine temp".to_string());
-            map.x_axis_correction = Some(0.1);  // Kelvin*10 to Kelvin
-            map.x_axis_offset = Some(-273.15); // Kelvin to Celsius
+            // Premier axe (`rows` températures d'eau) = lignes → Y ; second
+            // axe (`cols` = 4 valeurs 700..950) = colonnes → X. Ce second axe
+            // est la pression atmosphérique en hPa, pas un régime (réf. XDF
+            // 03G906016AB 376708 : 0x1E22EA et 0x1E7B06). Ils étaient
+            // inversés, l'axe à 3 points servant aux 4 colonnes.
+            map.y_axis_address = Some(x_axis_start as u32);
+            map.y_label = Some("Coolant temp (°C)".to_string());
+            map.y_axis_correction = Some(0.1);
+            map.y_axis_offset = Some(-273.14);
 
-            // Y axis
-            map.y_axis_address = Some(y_axis_start as u32);
-            map.y_label = Some("rpm".to_string());
-            map.y_axis_correction = Some(1.0);
-            map.y_axis_offset = Some(0.0);
+            map.x_axis_address = Some(y_axis_start as u32);
+            map.x_label = Some("Atm pressure (mbar)".to_string());
+            map.x_axis_correction = Some(1.0);
+            map.x_axis_offset = Some(0.0);
+            map.description = Some(
+                "Idle speed setpoint (rpm) | X: Atm pressure (mbar) | Y: Coolant temp (°C)".to_string(),
+            );
 
             maps.push(map);
         }
@@ -9683,6 +9814,41 @@ mod tests {
         data[off..off + 2].copy_from_slice(&0x600u16.to_be_bytes());
         let maps = detector.detect_soi_correction_blocks(&data, 0, data.len(), &HashSet::new());
         assert!(maps.is_empty());
+    }
+
+    /// Consigne chaude 1x4 suivie de la carte froide sur le même axe
+    /// pression, et courbe de démarrage à l'axe identique plus haut
+    /// (disposition 03G906016AB 376708).
+    #[test]
+    fn test_idle_setpoint_curves() {
+        let hpa = [700u16, 850, 900, 950];
+        let mut data = vec![0xFFu8; 0x40];
+        put_u16(&mut data, &[4]);
+        put_u16(&mut data, &hpa);
+        let drive_away = data.len();
+        put_u16(&mut data, &[903, 860, 830, 830, 930]);
+        data.extend_from_slice(&[0xFF; 0x100]);
+        put_u16(&mut data, &[4]);
+        put_u16(&mut data, &hpa);
+        let warm = data.len();
+        put_u16(&mut data, &[903, 860, 830, 830, 3, 4, 2531, 2731, 2931]);
+        put_u16(&mut data, &hpa);
+        let cold = data.len();
+        put_u16(&mut data, &[1400; 12]);
+        data.extend_from_slice(&[0xFF; 0x40]);
+
+        let detector = EDC16U34Detector::new(EDC16Variant::EDC16U34);
+        let (maps, cold_idle) = detector.detect_idle_setpoint_curves(&data, 0, data.len());
+        assert_eq!(cold_idle, Some(cold as u32));
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps[0].address as usize, warm);
+        assert_eq!(maps[0].name.as_deref(), Some("Idle speed setpoint warm engine"));
+        assert_eq!(maps[1].address as usize, drive_away);
+
+        // Sans carte froide derrière, aucune courbe n'est retenue
+        data[warm + 8..warm + 10].copy_from_slice(&9u16.to_be_bytes());
+        let (maps, cold_idle) = detector.detect_idle_setpoint_curves(&data, 0, data.len());
+        assert!(maps.is_empty() && cold_idle.is_none());
     }
 
     /// Driver wish inverse 12x16 ; la même forme en 16x16 (map de swirl)

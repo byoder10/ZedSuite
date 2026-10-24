@@ -236,7 +236,12 @@ pub fn import_map_definitions(
 ///       limitations lambda mises à zéro et switchs de fumée retrouvés sur
 ///       un fichier préparé ; plus de « EGR hysteresis » dans le code des
 ///       2 Mo — réf. 03G906016AB d'origine / immo-ON-BAK.
-pub const DETECTOR_VERSION: u32 = 52;
+///   53 — EDC16U34 : consignes de ralenti moteur chaud et au démarrage
+///       (courbes 1x4 sur la pression atmo), axes de la carte de ralenti
+///       3x4 remis dans l'ordre (X = pression, Y = température d'eau),
+///       coupure de démarreur nommée comme telle, et plus de « Single value
+///       idle speed » quand les courbes de consigne existent.
+pub const DETECTOR_VERSION: u32 = 53;
 
 /// Version du moteur de détection, pour comparaison avec celle enregistrée
 /// dans un projet.
@@ -422,6 +427,10 @@ fn build_expected_report(
                         _ => false,
                     })
                     .count()
+            } else if label == "Single value idle speed" {
+                // EDC16U34 : consigne de ralenti en courbe (warm engine), pas
+                // en scalaire
+                count_starts(prefix) + count_starts("Idle speed setpoint warm engine")
             } else if label == "Driver Wish (groupe)" {
                 // Le sélecteur porte le préfixe sans être une driver wish
                 count_starts(prefix) - count_starts("Driver Wish Selector")
