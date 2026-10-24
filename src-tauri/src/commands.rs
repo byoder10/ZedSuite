@@ -225,7 +225,12 @@ pub fn import_map_definitions(
 ///       que l'axe de régime a été réécrit) ; EDC16U34 : un SVRL sous
 ///       3000 tr/min n'est plus retenu (issue #50) ; MAP linearisation à
 ///       l'axe brut, comme EDCSuite (913 et 44 sur un capteur 4 bars).
-pub const DETECTOR_VERSION: u32 = 50;
+///   51 — EDC16U34 : corrections d'avance (démarrage, température d'air,
+///       altitude) avec leurs sélecteurs, sélecteur des driver wish, driver
+///       wish inverse, MAF linearisation et pause minimale après la
+///       principale affichées (cette dernière en µs, axe en °V) — réf. XDF
+///       complète 03G906016AB 376708.
+pub const DETECTOR_VERSION: u32 = 51;
 
 /// Version du moteur de détection, pour comparaison avec celle enregistrée
 /// dans un projet.
@@ -411,6 +416,9 @@ fn build_expected_report(
                         _ => false,
                     })
                     .count()
+            } else if label == "Driver Wish (groupe)" {
+                // Le sélecteur porte le préfixe sans être une driver wish
+                count_starts(prefix) - count_starts("Driver Wish Selector")
             } else {
                 count_starts(prefix)
             },
